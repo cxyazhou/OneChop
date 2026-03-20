@@ -41,7 +41,7 @@ NAME_FRAME_NUM = SAMPLE_RATE // FRAMES_PER_BUFFER * 2 # 注册名帧数
 SPEAK_REG_SEN = 10  # 语音检测灵敏度
 
 # FunASR 配置
-FUNASR_SERVER_URL = f"ws://{config.get('speech_reg', 'funasr_url')}"  # FunASR WebSocket 服务器地址
+FUNASR_SERVER_URL = config.get('speech_reg', 'funasr_url').strip()  # FunASR WebSocket 服务器地址
 FUNASR_TIMEOUT = 30  # 识别超时时间（秒）
 
 class AudioBuffer:
