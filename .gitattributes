@@ -1,0 +1,2 @@
+base_service/funasr/model/asr_model/**/model.pt filter=lfs diff=lfs merge=lfs -text
+base_service/funasr/model/punc_model/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727/model.pt filter=lfs diff=lfs merge=lfs -text
