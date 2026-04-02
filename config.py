@@ -15,7 +15,7 @@ class ConfigManager:
             # 创建默认配置
             self.config['server'] = {
                 'enable': 'True',
-                'host': '0.0.0.0',
+                'host': '127.0.0.1',
                 'tcp_port': '8080',
                 'http_port': '8081',
                 'passwd': '123456'
@@ -40,7 +40,8 @@ class ConfigManager:
             self.config['speech_reg'] = {
                 'enable': 'True',
                 'username': 'speech_reg',
-                'funasr_url': 'ws://localhost:10095'
+                'funasr_url': 'ws://localhost:10095',
+                'wake_word': '小兔子'
             }
             
             self.save_config()

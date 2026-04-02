@@ -7,6 +7,7 @@ from typing import Dict, Optional
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from time import sleep
 
 from config import ConfigManager
 
@@ -824,3 +825,16 @@ def server_stop():
     global server
     if server:
         server.stop()
+
+def main():
+    server_start()
+    while True:
+        try:
+            sleep(1)
+        except KeyboardInterrupt:
+            break
+    
+    server_stop()
+
+if __name__ == '__main__':
+    main()

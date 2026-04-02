@@ -1,13 +1,10 @@
-import json
-import requests
 import os
 import time
 import threading
 import math
-import socket
+import struct
 import array
 import queue
-from datetime import datetime
 import pyaudio
 import array
 import websocket
@@ -15,8 +12,7 @@ import json as json_module
 import time
 import sys
 from time import sleep
-
-speech_reg_client = None
+import keyboard
 
 # 将项目根目录添加到 Python 路径
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,54 +25,70 @@ from client import check_username_exists
 
 config = ConfigManager()
 
+speech_reg_client = None
+
 # 音频配置
 SAMPLE_RATE = 16000  # 采样率
 CHANNELS = 1  # 单声道
 FORMAT = 2  # 16 位整数 (paInt16)
 FRAMES_PER_BUFFER = 1600  # 每帧采样点数
-
-# 语音识别配置
-CMD_FRAME_NUM = SAMPLE_RATE // FRAMES_PER_BUFFER * 5  # 命令词帧数
-NAME_FRAME_NUM = SAMPLE_RATE // FRAMES_PER_BUFFER * 2 # 注册名帧数
-SPEAK_REG_SEN = 10  # 语音检测灵敏度
+FRAMES_SIZE_PER_SECOND = SAMPLE_RATE * CHANNELS * FORMAT  # 每秒采样点数据大小
 
 # FunASR 配置
 FUNASR_SERVER_URL = config.get('speech_reg', 'funasr_url').strip()  # FunASR WebSocket 服务器地址
 FUNASR_TIMEOUT = 30  # 识别超时时间（秒）
-
-class AudioBuffer:
-    """音频缓冲区"""
-    def __init__(self, buffer_size=1024*100):
-        self.buffer = bytearray(buffer_size)
-        self.len = 0
-        self.buffer_size = buffer_size
-        self.last_buffer = bytearray(FRAMES_PER_BUFFER * 2)  # 最后一帧缓冲区
-        self.frame_size = FRAMES_PER_BUFFER * 2  # 每帧字节数 (16 位)
-        self.speak_start = 0
-        self.init_cnt = 5  # 初始化计数器
         
+MODE_KEYBOARD_RECORD = "keyboard_record"  # 键盘录音模式
+MODE_DIRECT_COMMAND = "direct_command"  # 直接命令模式
+MODE_WAKE_WORD = "wake_word"  # 唤醒词检测模式
+
+WAKE_WORD = config.get('speech_reg', 'wake_word').strip()  # 唤醒词
+
 class SpeechRegClient(TCPClient):
-    """语音注册客户端"""
+    """语音识别客户端"""
     def __init__(self):
         # 调用父类构造函数
         super().__init__()
-        
-        # 音频相关
-        self.audio_buffer = AudioBuffer()
-        self.audio_value = [0] * 5  # 最近 5 帧的 RMS 值
-        self.audio_init_cnt = 5
-        self.speak_sen = 0
-        self.speak_reg_sen = SPEAK_REG_SEN
-        
+                
         # PortAudio 相关
         self.pa = None
         self.stream = None
+        self.record_stream = None
         
         # 识别任务队列和线程
         self.recognition_queue = queue.Queue()
         self.recognition_thread = None
         self.is_recognizing = False
-    
+        self.recognition_lock = threading.Lock()
+
+        self.recognition_mode = MODE_WAKE_WORD
+       
+        self.is_recording_keyboard = False  # 是否正在录音
+        self.record_buffer_keyboard = bytearray()  # 录音缓冲区
+        self.record_lock_keyboard = threading.Lock()  # 录音锁
+
+        self.is_recording_command = False  # 是否正在录音
+        self.record_buffer_command = bytearray()  # 录音缓冲区
+        self.record_lock_command = threading.Lock()  # 录音锁
+
+        self.is_recording_wake = False  # 是否正在录音
+        self.record_buffer_wake = bytearray()  # 录音缓冲区
+        self.record_lock_wake = threading.Lock()  # 录音锁
+        self.wake_is_recognizing = False  # 唤醒词检测是否正在识别
+        self.wake_words_reg_end = False  # 唤醒词检测是否结束
+        self.is_wake = False  # 是否唤醒
+
+        self.audio_value = [0] * 5  # 最近 5 帧的 RMS 值
+        self.audio_init_cnt = 5
+        self.speak_reg_sen = 10
+        self.is_speaking = False  # 是否正在说话
+
+        self.speak_start_time = 0  # 开始说话时间
+        self.target_duration_command = 5  # 目标命令录音时长
+        self.target_duration_wake = 2  # 目标唤醒词检测录音时长
+
+        self.keyboard_listener = None  # 键盘监听线程
+            
     def process_message(self, message: Message):
         """
         重写父类方法，处理收到的消息
@@ -98,119 +110,7 @@ class SpeechRegClient(TCPClient):
         """广播消息"""
         message = Message(MessageType.BROADCAST, {"content": content}, sender=self.name, target="all_users")
         self.send_message(message)
-    
-    def audio_shot(self, audio_data):
-        """
-        音频检测算法 - 计算 RMS 并检测突变
-        :param audio_data: 音频数据 (16 位整数数组)
-        :return: 0 表示检测到突变，-1 表示正常
-        """
-        # 转换为 short 数组
-        pdata = array.array('h', audio_data)
-        frame_count = len(pdata)
         
-        # 计算 RMS（均方根）
-        sum_square = 0.0
-        interval = 10  # 计算采样点的间隔
-        
-        for cnt in range(frame_count):
-            if cnt % interval == 0:
-                sample = float(pdata[cnt])
-                sum_square += sample * sample
-        
-        # 计算 RMS 值
-        rms = math.sqrt(sum_square / (frame_count / interval)) / 32768.0
-        
-        cur = 0
-        if rms > 0:
-            cur = min(100, max(0, int(20.0 * math.log10(rms) + 70)))
-        
-        # 初始化前 5 帧
-        if self.audio_init_cnt > 0:
-            self.audio_value[5 - self.audio_init_cnt] = cur
-            self.audio_init_cnt -= 1
-            return -1
-        
-        # 计算最近 5 帧的平均 RMS 值
-        all_sum = sum(self.audio_value)
-        ave = all_sum // 5
-        
-        # 更新音频值缓冲区
-        for i in range(4):
-            self.audio_value[i] = self.audio_value[i + 1]
-        self.audio_value[4] = cur
-        
-        # 检测突变
-        if cur > ave and (cur - ave) > 5:
-            self.speak_sen = cur - ave
-        
-        if cur > (ave + self.speak_reg_sen):
-            return 0  # 检测到突变
-        
-        return -1  # 正常
-    
-    def reg_name(self, audio_data):
-        """
-        注册名字 - 收集音频
-        :param audio_data: 音频数据
-        :return: 需要识别的音频数据（bytes），如果没有收集完成则返回 None
-        """
-        # 初始化阶段
-        if self.audio_buffer.init_cnt > 0:
-            self.audio_buffer.init_cnt -= 1
-            # 保存最后一帧
-            frame_size = self.audio_buffer.frame_size
-            if len(audio_data) >= frame_size:
-                self.audio_buffer.last_buffer = audio_data[:frame_size]
-            return None
-        
-        # 检测是否开始说话
-        if self.audio_buffer.speak_start == 0:
-            sr_name_flag = self.audio_shot(audio_data)
-            if sr_name_flag != 0:
-                # 保存最后一帧
-                frame_size = self.audio_buffer.frame_size
-                if len(audio_data) >= frame_size:
-                    self.audio_buffer.last_buffer = audio_data[:frame_size]
-                return None
-            
-            print("检测到开始说话")
-            self.audio_buffer.speak_start = NAME_FRAME_NUM
-            
-            # 清空缓冲区
-            self.audio_buffer.buffer = bytearray(self.audio_buffer.buffer_size)
-            self.audio_buffer.len = 0
-            
-            # 保存第一帧
-            self.audio_buffer.buffer[:len(audio_data)] = audio_data
-            self.audio_buffer.len += len(audio_data)
-            
-            self.audio_buffer.speak_start -= 1
-            return None
-        
-        # 继续收集音频
-        self.audio_buffer.speak_start -= 1
-        
-        # 添加到缓冲区
-        if self.audio_buffer.len + len(audio_data) <= self.audio_buffer.buffer_size:
-            self.audio_buffer.buffer[self.audio_buffer.len:self.audio_buffer.len + len(audio_data)] = audio_data
-            self.audio_buffer.len += len(audio_data)
-        
-        # 收集完成，返回音频数据供识别
-        if self.audio_buffer.speak_start == 0:
-            print(f"音频收集完成，长度：{self.audio_buffer.len} 字节")
-            
-            # 返回需要识别的音频数据
-            audio_to_recognize = bytes(self.audio_buffer.buffer[:self.audio_buffer.len])
-            
-            # 重置状态
-            self.audio_buffer.speak_start = 0
-            self.audio_buffer.init_cnt = 5
-            
-            return audio_to_recognize
-        
-        return None
-    
     def recognize_audio(self, audio_data):
         """
         识别音频
@@ -299,18 +199,18 @@ class SpeechRegClient(TCPClient):
         try:
             self.pa = pyaudio.PyAudio()
             
-            # 打开音频流
-            self.stream = self.pa.open(
-                format=self.pa.get_format_from_width(2),  # 16 位
+            # 打开音频流（用于录音）
+            self.record_stream = self.pa.open(
+                format=self.pa.get_format_from_width(FORMAT),
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
                 frames_per_buffer=FRAMES_PER_BUFFER,
-                stream_callback=self.audio_callback
+                stream_callback=self.record_callback
             )
             
-            self.stream.start_stream()
-            print("音频捕获已启动")
+            self.record_stream.start_stream()
+            print("音频录制已启动")
             
             # 启动识别处理线程
             self.recognition_thread = threading.Thread(target=self.process_recognition_queue)
@@ -318,84 +218,394 @@ class SpeechRegClient(TCPClient):
             self.recognition_thread.start()
             print("识别处理线程已启动")
             
+            # 启动键盘监听
+            self.start_keyboard_listener()
+                    
         except Exception as e:
             print(f"启动音频捕获失败：{e}")
     
+    def stop_audio_capture(self):
+        # 发送退出信号到识别队列
+        self.recognition_queue.put(None)  # 退出信号
+        
+        # 停止键盘监听
+        try:
+            if hasattr(self, 'keyboard_hook') and self.keyboard_hook:
+                keyboard.unhook(self.keyboard_hook)
+            self.keyboard_hooks_registered = False
+            print("键盘监听已停止")
+        except Exception as e:
+            print(f"停止键盘监听时出错：{e}")
+        
+        # 停止音频流
+        if self.record_stream:
+            self.record_stream.stop_stream()
+            self.record_stream.close()
+        
+        if self.pa:
+            self.pa.terminate()
+
+    def record_callback(self, in_data, frame_count, time_info, status):
+        # 这里需要加锁，确保线程安全写入缓冲区，读取的地方也需要加锁并且进行拷贝后将缓冲区数据清空及重置录音状态
+        with self.record_lock_keyboard:
+            if self.is_recording_keyboard:
+                self.record_buffer_keyboard.extend(in_data)
+        
+        with self.record_lock_command:
+            if self.is_recording_command:
+                self.record_buffer_command.extend(in_data)
+        
+        with self.record_lock_wake:
+            if self.is_recording_wake:
+                self.record_buffer_wake.extend(in_data)
+        
+        if self.recognition_mode == MODE_DIRECT_COMMAND:
+            self.detect_speech_command(in_data)
+
+        if self.recognition_mode == MODE_WAKE_WORD:
+            if not self.wake_is_recognizing:
+                self.detect_speech_wake(in_data)
+            else:
+                self.wake_process(in_data)
+        
+        return (None, pyaudio.paContinue)
+    
+    def detect_speech_command(self, in_data):
+        """自动检测语音并开始录音"""
+        # 计算音频 RMS 值        
+        frame_size = len(in_data)
+        sum_square = 0.0
+        interval = 10
+        
+        for cnt in range(0, frame_size, 2):  # 16 位音频，每 2 个字节一个采样点
+            if (cnt // 2) % interval == 0:
+                sample = struct.unpack('<h', in_data[cnt:cnt+2])[0]
+                sum_square += sample * sample
+        
+        rms = math.sqrt(sum_square / (frame_size // 2 // interval)) / 32768.0
+        
+        cur = 0
+        if rms > 0:
+            cur = min(100, max(0, int(20.0 * math.log10(rms) + 70)))
+        
+        # 初始化前 5 帧
+        if self.audio_init_cnt > 0:
+            self.audio_value[5 - self.audio_init_cnt] = cur
+            self.audio_init_cnt -= 1
+            return
+        
+        # 计算最近 5 帧的平均 RMS 值
+        all_sum = sum(self.audio_value)
+        ave = all_sum // 5
+        
+        # 更新音频值缓冲区
+        for i in range(4):
+            self.audio_value[i] = self.audio_value[i + 1]
+        self.audio_value[4] = cur
+        
+        # 检测是否开始说话（音量陡升）
+        if cur > (ave + self.speak_reg_sen) and not self.is_speaking:
+            # 开始说话，启动录音
+            self.is_speaking = True
+            self.speak_start_time = time.time()
+
+            with self.record_lock_command:
+                if not self.is_recording_command:
+                    self.is_recording_command = True
+                    self.record_buffer_command.extend(in_data)
+                    print("开始命令录音...")
+        
+        # 如果正在说话，检查是否达到目标时长
+        if self.is_speaking:
+            elapsed = time.time() - self.speak_start_time
+            if elapsed >= self.target_duration_command:
+                # 达到目标时长，停止录音
+                self.is_speaking = False
+
+                audio_data = b''
+                with self.record_lock_command:
+                    if len(self.record_buffer_command) > 0:
+                        audio_data = bytes(self.record_buffer_command)
+                    self.is_recording_command = False
+                    print(f"命令录音结束，录制了 {len(self.record_buffer_command)} 字节")
+                    self.record_buffer_command.clear()
+                
+                # 将录音数据放入识别队列
+                if len(audio_data) >= FRAMES_SIZE_PER_SECOND:
+                    if self.recognition_queue.qsize() > 0:
+                        print("识别队列已满，已忽略")
+                    else:
+                        with self.recognition_lock:
+                            if not self.is_recognizing:
+                                self.recognition_queue.put(audio_data)
+                            else:
+                                print("上一次识别未完成，已忽略")
+                else:
+                    print("录音数据过短，已忽略")
+
+    def detect_speech_wake(self, in_data):
+        """自动检测语音并开始录音"""
+        # 计算音频 RMS 值        
+        frame_size = len(in_data)
+        sum_square = 0.0
+        interval = 10
+        
+        for cnt in range(0, frame_size, 2):  # 16 位音频，每 2 个字节一个采样点
+            if (cnt // 2) % interval == 0:
+                sample = struct.unpack('<h', in_data[cnt:cnt+2])[0]
+                sum_square += sample * sample
+        
+        rms = math.sqrt(sum_square / (frame_size // 2 // interval)) / 32768.0
+        
+        cur = 0
+        if rms > 0:
+            cur = min(100, max(0, int(20.0 * math.log10(rms) + 70)))
+        
+        # 初始化前 5 帧
+        if self.audio_init_cnt > 0:
+            self.audio_value[5 - self.audio_init_cnt] = cur
+            self.audio_init_cnt -= 1
+            return
+        
+        # 计算最近 5 帧的平均 RMS 值
+        all_sum = sum(self.audio_value)
+        ave = all_sum // 5
+        
+        # 更新音频值缓冲区
+        for i in range(4):
+            self.audio_value[i] = self.audio_value[i + 1]
+        self.audio_value[4] = cur
+        
+        # 检测是否开始说话（音量陡升）
+        if cur > (ave + self.speak_reg_sen) and not self.is_speaking:
+            # 开始说话，启动录音
+            self.is_speaking = True
+            self.speak_start_time = time.time()
+
+            with self.record_lock_wake:
+                if not self.is_recording_wake:
+                    self.is_recording_wake = True
+                    self.record_buffer_wake.extend(in_data)
+                    print("开始唤醒词检测录音...")
+        
+        # 如果正在说话，检查是否达到目标时长
+        if self.is_speaking:
+            elapsed = time.time() - self.speak_start_time
+            if elapsed >= self.target_duration_wake:
+                # 达到目标时长，停止录音
+                self.is_speaking = False
+
+                audio_data = b''
+                with self.record_lock_wake:
+                    if len(self.record_buffer_wake) > 0:
+                        audio_data = bytes(self.record_buffer_wake)
+                    self.is_recording_wake = False
+                    print(f"唤醒词检测录音结束，录制了 {len(self.record_buffer_wake)} 字节")
+                    self.record_buffer_wake.clear()
+                
+                # 将录音数据放入识别队列
+                if len(audio_data) >= FRAMES_SIZE_PER_SECOND:
+                    if self.recognition_queue.qsize() > 0:
+                        print("识别队列已满，已忽略")
+                    else:
+                        with self.recognition_lock:
+                            if not self.is_recognizing:
+                                self.recognition_queue.put(audio_data)
+                                self.wake_is_recognizing = True
+                                self.wake_words_reg_end = False
+                            else:
+                                print("上一次识别未完成，已忽略")
+                else:
+                    print("录音数据过短，已忽略")
+
+    def wake_process(self, in_data):
+        """唤醒词检测处理"""
+        if not self.wake_words_reg_end:
+            return
+
+        if not self.is_wake:
+            self.wake_is_recognizing = False
+            return
+        
+        if not self.is_speaking:
+            # 开始说话，启动录音
+            self.is_speaking = True
+            self.speak_start_time = time.time()
+
+            with self.record_lock_wake:
+                if not self.is_recording_wake:
+                    self.is_recording_wake = True
+                    self.record_buffer_wake.extend(in_data)
+                    print("开始唤醒后录音...")
+        
+        # 如果正在说话，检查是否达到目标时长
+        if self.is_speaking:
+            elapsed = time.time() - self.speak_start_time
+            if elapsed >= self.target_duration_command:
+                # 达到目标时长，停止录音
+                self.is_speaking = False
+
+                audio_data = b''
+                with self.record_lock_wake:
+                    if len(self.record_buffer_wake) > 0:
+                        audio_data = bytes(self.record_buffer_wake)
+                    self.is_recording_wake = False
+                    print(f"唤醒后录音结束，录制了 {len(self.record_buffer_wake)} 字节")
+                    self.record_buffer_wake.clear()
+                
+                # 将录音数据放入识别队列
+                if len(audio_data) >= FRAMES_SIZE_PER_SECOND:
+                    if self.recognition_queue.qsize() > 0:
+                        print("识别队列已满，已忽略")
+                    else:
+                        with self.recognition_lock:
+                            if not self.is_recognizing:
+                                self.recognition_queue.put(audio_data)
+                            else:
+                                print("上一次识别未完成，已忽略")
+                else:
+                    print("录音数据过短，已忽略")
+                    
+                self.wake_is_recognizing = False
+
+    def start_keyboard_listener(self):
+        """启动键盘监听线程"""
+        
+        # 防止重复注册
+        if hasattr(self, 'keyboard_hooks_registered') and self.keyboard_hooks_registered:
+            print("键盘监听已启动，跳过重复注册")
+            return
+        
+        # 按键状态
+        self.ctrl_pressed = False
+        
+        def keyboard_handler(event):
+            try:
+                key_name = getattr(event, 'name', str(event))
+                event_type = getattr(event, 'event_type', 'unknown')
+                
+                # print(f"键盘事件：{event_type} - {key_name}")
+                
+                if event_type == 'down':
+                    # 功能键处理（只响应按下事件）
+                    # Ctrl 键按下
+                    if key_name in ['ctrl', 'left ctrl', 'right ctrl']:
+                        self.ctrl_pressed = True
+                    # 检查是否在按 Ctrl 的同时按下空格
+                    elif key_name == 'space' and self.ctrl_pressed:
+                        if self.recognition_mode == MODE_KEYBOARD_RECORD:
+                            with self.record_lock_keyboard:
+                                if not self.is_recording_keyboard:
+                                    self.is_recording_keyboard = True
+                                    print("开始录音...")
+                
+                elif event_type == 'up':
+                    # 按键释放
+                    if key_name in ['ctrl', 'left ctrl', 'right ctrl']:
+                        self.ctrl_pressed = False
+                    # 检查空格键是否释放
+                    elif key_name == 'space':
+                        audio_data = b''
+                        with self.record_lock_keyboard:
+                            if len(self.record_buffer_keyboard) > 0:
+                                audio_data = bytes(self.record_buffer_keyboard)
+                            self.is_recording_keyboard = False
+                            print(f"键盘录音结束，录制了 {len(self.record_buffer_keyboard)} 字节")
+                            self.record_buffer_keyboard.clear()
+                        
+                        # 将录音数据放入识别队列
+                        if len(audio_data) >= FRAMES_SIZE_PER_SECOND:
+                            if self.recognition_queue.qsize() > 0:
+                                print("识别队列已满，已忽略")
+                            else:
+                                with self.recognition_lock:
+                                    if not self.is_recognizing:
+                                        self.recognition_queue.put(audio_data)
+                                    else:
+                                        print("上一次识别未完成，已忽略")
+                        else:
+                            print("录音数据过短，已忽略")
+            except Exception as e:
+                print(f"键盘处理函数出错：{e}")
+        
+        # 注册全局键盘事件钩子
+        self.keyboard_hook = keyboard.hook(keyboard_handler)
+        self.keyboard_hooks_registered = True
+        
+        print("键盘监听已启动（按住 Ctrl+ 空格键录音）")
+    
     def process_recognition_queue(self):
         """处理识别队列的后台线程"""
-        print("识别处理线程开始运行...")
         while self.running:
             try:
+                if self.recognition_queue.empty():
+                    sleep(0.1)
+                    continue
+
+                with self.recognition_lock:
+                    self.is_recognizing = True
+                
                 # 从队列中获取音频数据进行识别
                 audio_data = self.recognition_queue.get(timeout=1.0)
                 
                 if audio_data is None:
                     # 退出信号
+                    print("audio_data 为空，识别处理线程退出")
+                    with self.recognition_lock:
+                        self.is_recognizing = False
                     break
                 
                 # 执行识别
-                self.is_recognizing = True
                 result = self.recognize_audio(audio_data)
-                self.is_recognizing = False
                 
-                # 如果有识别结果，发送出去
-                if result and len(result) > 0:
-                    print(f"识别结果：{result}")
-                    self.broadcast(f"[语音识别] {self.name}: {result}")
+                # 如果有识别结果，处理
+                #if result and len(result) > 0:
+                #    print(f"识别结果：{result}")
+
+                command = None
+
+                if self.recognition_mode == MODE_DIRECT_COMMAND or self.recognition_mode == MODE_KEYBOARD_RECORD:
+                    command = result
+
+                if self.recognition_mode == MODE_WAKE_WORD:
+                    if self.is_wake:
+                        command = result
+                    if WAKE_WORD in result:
+                        self.is_wake = True
+                    else:
+                        self.is_wake = False
+
+                self.wake_words_reg_end = True
+
+                with self.recognition_lock:
+                    self.is_recognizing = False
+
+                if command is not None:
+                    print(f"命令：{command}")
+                    self.broadcast(f"[命令] {self.name}: {command}")
                 
+                if(command == "键盘录制"):
+                    self.recognition_mode = MODE_KEYBOARD_RECORD
+                elif(command == "识别命令"):
+                    self.recognition_mode = MODE_DIRECT_COMMAND
+                elif(command == "唤醒模式"):
+                    self.recognition_mode = MODE_WAKE_WORD
+
             except queue.Empty:
                 # 队列为空，继续等待
                 continue
             except Exception as e:
                 print(f"处理识别队列时出错：{e}")
-                self.is_recognizing = False
+                with self.recognition_lock:
+                    self.is_recognizing = False
         
         print("识别处理线程已退出")
-    
-    def audio_callback(self, in_data, frame_count, time_info, status):
-        """音频回调函数 - 只负责收集音频，不阻塞识别"""
-        if self.running:
-            # 将音频数据交给 reg_name 处理（检测是否开始说话）
-            result = self.reg_name(in_data)
-            
-            # 如果有识别结果，加入队列异步处理
-            # 注意：reg_name 返回的是需要识别的音频数据
-            if result is not None and isinstance(result, bytes):
-                # 将音频数据放入队列，由后台线程处理
-                if self.recognition_queue.qsize() < 1:
-                    self.recognition_queue.put(result)
-        
-        return (None, pyaudio.paContinue)
-    
-    def close(self):
-        """关闭连接"""
-        self.running = False
-        
-        # 发送退出信号到识别队列
-        if hasattr(self, 'recognition_queue'):
-            self.recognition_queue.put(None)  # 退出信号
-        
-        # 停止音频流
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        
-        if self.pa:
-            self.pa.terminate()
-        
-        # 关闭 socket
-        if self.socket:
-            try:
-                self.socket.shutdown(socket.SHUT_RDWR)
-                self.socket.close()
-            except:
-                pass
 
 def speech_reg_start():
     global speech_reg_client
-
-    """启动语音注册客户端"""    
-    config = ConfigManager()
+    global config
+    
+    """启动语音识别客户端"""    
     
     # 获取用户名
     name = config.get('speech_reg', 'username')
@@ -421,9 +631,10 @@ def speech_reg_start():
 def speech_reg_stop():
     global speech_reg_client
     
-    """关闭语音注册客户端"""
+    """关闭语音识别客户端"""
     if speech_reg_client:
         try:
+            speech_reg_client.stop_audio_capture()
             speech_reg_client.close()
         except Exception as e:
             print(f"speech_reg 关闭连接时出错：{e}")
