@@ -12,16 +12,19 @@
 - 系统提供一些基础服务功能供用户调用，如语音转文字、文字转语音等
 - 用户可能依赖第三方服务，如ollama服务、LocallAI服务等
 
-## 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
 ## 运行
 ```bash
+# 下载代码
+git clone https://github.com/cxyazhou/OneChop
+# 下载模型
+cd OneChop
+git lfs pull
+# 安装python依赖包，python版本号：3.12
+pip install -r requirements.txt
+# 运行
 python main.py
 ```
+
 ## 模块介绍
 
 ### 一、服务器

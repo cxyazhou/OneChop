@@ -13,6 +13,10 @@ import time
 import sys
 from time import sleep
 import keyboard
+import logging
+
+# 禁用 websocket 库的日志
+logging.getLogger('websocket').setLevel(logging.WARNING)
 
 # 将项目根目录添加到 Python 路径
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,7 +65,7 @@ class SpeechRegClient(TCPClient):
         self.is_recognizing = False
         self.recognition_lock = threading.Lock()
 
-        self.recognition_mode = MODE_WAKE_WORD
+        self.recognition_mode = MODE_KEYBOARD_RECORD
        
         self.is_recording_keyboard = False  # 是否正在录音
         self.record_buffer_keyboard = bytearray()  # 录音缓冲区
