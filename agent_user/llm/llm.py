@@ -179,6 +179,14 @@ class LLMClient(TCPClient):
             #    reply = generate_chat(content)
             #    if reply:
             #        self.send_private_message(message.sender, reply)
+        elif message.type == MessageType.BROADCAST:
+            content = message.data.get('content', '')
+            # 收到广播消息
+            if message.sender == config.get('speech_reg', 'username'):
+                if content:
+                    reply = generate_chat(content)
+                    if reply:
+                        self.send_private_message(message.sender, reply)
 
 def llm_start():
     global llm_client

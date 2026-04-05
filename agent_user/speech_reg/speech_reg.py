@@ -98,7 +98,11 @@ class SpeechRegClient(TCPClient):
         重写父类方法，处理收到的消息
         :param message: Message 对象，包含发送方、内容等信息
         """
-        pass
+        content = message.data.get('content', '')
+        if message.type == MessageType.PRIVATE_MESSAGE:
+            # 收到私聊消息
+            content = message.data.get('content', '')
+            print(f"speech_reg get private message: {content}")
     
     def send_private_message(self, target: str, content: str):
         """发送私聊消息"""
@@ -586,7 +590,7 @@ class SpeechRegClient(TCPClient):
 
                 if command is not None:
                     print(f"命令：{command}")
-                    self.broadcast(f"[命令] {self.name}: {command}")
+                    self.broadcast(f"{command}")
                 
                 if(command == "键盘录制"):
                     self.recognition_mode = MODE_KEYBOARD_RECORD
